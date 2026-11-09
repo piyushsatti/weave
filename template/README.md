@@ -1,0 +1,236 @@
+# example
+
+One line about what this plugin does.
+
+## Layout
+
+| Path | Holds |
+|---|---|
+| `foundry.plugin.yaml` | What this plugin is, which harnesses it is built for, and what it needs |
+| `skills/` | One directory per skill, exactly one level deep, each holding a `SKILL.md` |
+| `agents/` | One file per agent |
+| `commands/` | One file per command |
+| `hooks/hooks.yaml` | Hooks, if this plugin has any. Neutral, never shipped as written |
+| `mcp.json` | MCP servers, if this plugin has any. Neutral, and Claude Code reads `.mcp.json` |
+| `scripts/foundry.py` | Fetches Foundry and hands over to its build tool |
+| `tests/` | Not shipped |
+
+Skills sit exactly one level under `skills/`. Some harnesses look one level down
+and some recurse, so a grouping directory would ship intact on part of the list
+and hide every skill beneath it on the rest, with no error anywhere. The build
+refuses one rather than let that happen.
+
+## Writing a hook
+
+`hooks/hooks.yaml` is a list of blocks. It is a neutral form and it never ships:
+every harness with a hook surface has its own event names, so the emitter for
+each one translates this file and removes it.
+
+```yaml
+- at: before-tool
+  match: Bash
+  run: hooks/guard.sh
+```
+
+| Key | Is |
+|---|---|
+| `at` | one of the six moments below |
+| `run` | a path to a file in this repository, not a shell line |
+| `match` | optional, one pattern |
+| `only` | optional, the harnesses this rule is for |
+| `timeout` | optional, a whole number of seconds greater than zero |
+
+A rule naming anything else is refused rather than ignored, because an ignored
+key in a guard is a guard that does less than it appears to.
+
+| Moment | Runs |
+|---|---|
+| `session-start` | when a session begins |
+| `before-tool` | before a tool call |
+| `after-tool` | after a tool call |
+| `turn-end` | when the assistant has finished responding |
+| `before-compact` | before the context is compacted |
+| `session-end` | when a session ends |
+
+The first three and the last are what every harness with a hook surface has in
+common, so any harness that carries hooks at all carries those four. `turn-end`
+and `before-compact` are not universal: a harness can carry hooks and still have
+no event for either, and today Claude Code is the only one Foundry emits for
+that has both.
+
+That is what `only` is for. Name the harnesses a rule is for and it is absent
+everywhere else, recorded as a loss on every build and written into the lock
+file of each folder that does not carry it:
+
+```yaml
+- at: before-compact
+  run: hooks/save.sh
+  only: [claude-code]
+```
+
+A moment outside the six is a hook that does not fire, and so is a rule reserved
+for harnesses that carry no hooks in this build. Both are refused rather than
+approximated.
+
+`run` is a path so that the build can check the file is really there and really
+ships. Put any shell work inside that file. Note that `exclude` in the manifest
+lists `scripts`, so a hook script belongs somewhere that ships, such as beside
+the rules in `hooks/`.
+
+Write the moment as `at` and never as `on`. YAML reads a bare `on` as the
+boolean true, so `on: before-tool` arrives naming no moment at all. The build
+refuses that by name rather than leaving you to find it.
+
+## Declaring an MCP server
+
+`mcp.json` is the neutral form, and like `hooks/hooks.yaml` it is translated
+rather than shipped as written: Claude Code reads `.mcp.json`, so the emitter
+writes that name and removes this one.
+
+```json
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+  "mcpServers": {
+    "example": {
+      "type": "stdio",
+      "command": "python3",
+      "args": ["${PLUGIN_ROOT}/mcp/server.py"]
+    }
+  }
+}
+```
+
+**That `$schema` value is exact and the build checks it.** It names the
+specification the file was written against, which is a fact rather than
+boilerplate, and a version a client does not recognise makes that client
+disable MCP for the plugin and carry on, so the plugin installs and the server
+is not there.
+
+| Write | Never write | Because |
+|---|---|---|
+| `${PLUGIN_ROOT}`, `${PLUGIN_DATA}` | `${CLAUDE_PLUGIN_ROOT}`, `${CLAUDE_PLUGIN_DATA}` | The neutral pair is renamed for each harness that uses different names. Writing a harness's own pair here reaches every other harness as literal text inside a path |
+| `stdio`, `sse`, `streamable-http` | a transport not on this list | These three cross over untranslated. Claude Code takes `streamable-http` as an alias for its own `http` |
+
+The server's own files are ordinary content and ship like anything else, so
+`mcp/server.py` above needs no manifest line. Keep it out of `exclude`, and
+remember `scripts` is excluded, so a server does not belong there.
+
+Two harnesses cannot start a server at all: Pi has no MCP surface, and OpenCode
+reads servers from the user's own configuration, which no shipped folder can
+write. Both need a `degrade` line naming `mcp` before a plugin declaring one can
+be built for them.
+
+## Build
+
+```
+python3 scripts/foundry.py check
+python3 scripts/foundry.py build --out dist
+```
+
+Both go through `scripts/foundry.py`, which fetches the Foundry the manifest's
+`foundry:` line names and hands over to it. Running a Foundry checkout's own
+`build.py` against this repository instead runs whatever is in that checkout and
+ignores that line, so a manifest can build that way and be refused here. Every
+build prints both numbers, `built with Foundry X, resolved to Y`, and CI runs Y.
+
+`check` builds into a temporary directory and throws it away, which is what CI
+runs on every push. `build` writes `dist/`: one self-contained folder per
+harness named under `targets`, each with its own `foundry.lock.json` recording
+exactly what went into it, plus `foundry.release.json` naming every folder, its
+fingerprint, and anything that folder had to leave out. With one harness named,
+or none, `dist/` is that folder itself.
+
+Those folders are what gets published and what people install. Nothing is
+resolved on the machine of whoever installs it. They get the folder.
+
+## Which harnesses this plugin is built for
+
+`targets` in the manifest names them. Delete the key and the answer is
+`claude-code` alone.
+
+| Name | What that folder is | Who reads it |
+|---|---|---|
+| `agent-plugins` | the portable Agent Plugins 1.0.0 package | Cursor, GitHub Copilot, VS Code, Kiro, ChatGPT |
+| `claude-code` | `.claude-plugin/plugin.json` and every kind Foundry models | Claude Code |
+| `codex` | the portable package plus the manifest Codex reads today | OpenAI Codex |
+| `instructions` | `AGENTS.md`, `CLAUDE.md` and `GEMINI.md` | anything, by a different route: see below |
+| `opencode` | a loose tree of `skills/` and `agents/`, no manifest | OpenCode |
+| `pi` | a loose tree of `skills/` and `prompts/`, no manifest | Pi |
+
+One source, one version number, one release. The same version across those
+folders means the same source and the same dependencies. It does not mean the
+same contents, and each folder's fingerprint is a fact about that folder alone.
+
+Two folders showing the same fingerprint is not an error. It means those two
+harnesses were handed the same files, which is what happens to `opencode` and
+`pi` in a repository that has no content yet. They separate as soon as it does.
+
+`opencode` and `pi` are loose files rather than packages. Neither harness has an
+install command, a version or an update path, so a person copies the folder's
+contents into a configuration directory by hand. Say that in this README rather
+than claiming support.
+
+`instructions` is not a package at all. It is copied into a repository somebody
+already owns, and nothing then installs it, updates it or removes it: a later
+version of this plugin does not reach the copy. No harness lets a package carry
+a repository instructions file, so this is the only route there is.
+
+## When a harness cannot carry something, the build stops
+
+Harnesses differ. Agent Plugins 1.0.0 covers skills and MCP servers and leaves
+agents, commands and hooks outside version 1. Pi has no MCP surface. OpenCode
+has no declarative hooks. Declare one of those and name that harness, and the
+build refuses:
+
+```
+CANNOT SHIP THIS TO PI.
+
+  mcp/manifold is declared in foundry.plugin.yaml, and Pi has no MCP surface.
+
+  Either drop pi from 'targets', or write it down under
+  'degrade.pi.drop: [mcp]' so the loss is on the record.
+```
+
+**That is the normal answer, not a bug.** The alternative is a folder that
+installs, reports success and does less than this README says, which nobody
+finds out about.
+
+Take the two ways forward literally. Removing the harness from `targets` is one
+line. Writing the loss down under `degrade` is a block, and it is more work on
+purpose, because a diminished folder should feel like a decision:
+
+```yaml
+degrade:
+  pi:
+    drop: [mcp]
+```
+
+A recorded drop is printed on every build and written into that folder's lock
+file and into `foundry.release.json`. Read the refusal before writing the line.
+If an MCP server is the whole point of this plugin, a Pi folder without it is an
+empty wrapper and dropping `pi` from `targets` is the honest answer.
+
+## Depending on another plugin
+
+Add it under `requires.plugins` in the manifest with an exact pin, and list what
+to take. A pin never points at a moving target: it has to mean the same thing
+tomorrow.
+
+The pin is the fingerprint of that plugin's **source checkout**. It is not the
+`contents` value in its lock file, which fingerprints what that plugin shipped
+and is a different number. Write any placeholder and build once: the refusal
+reports the fingerprint actually on disk, and that is the number to keep.
+
+Read it from a checkout that has not been built into, which the build now
+insists on rather than only advising. A directory holding `foundry.lock.json`
+or `foundry.release.json` is a release Foundry wrote, not source, and finding
+one stops the build and names it: hashed in, a dependency that has been built
+fingerprints differently from the same source freshly cloned, so the pin is one
+no clean checkout or CI runner can reproduce. Delete the output, or point
+`--out` outside the tree. Adding it to `exclude` does not work and the refusal
+says so, because `exclude` decides what ships and never reaches the
+fingerprint.
+
+If two things you depend on hand over something with the same name, or expect
+different builds of the same third plugin, the build stops and names both
+sides. It does not pick one.

@@ -1,0 +1,728 @@
+#!/usr/bin/env python3
+"""One plugin, one staged tree, one folder per harness the author asked for.
+
+The seam is after the staged tree is complete and before any lock file is
+written. Everything to the left of it is the build tool that already existed:
+resolution, fingerprinting, collisions, the `provides` check. Everything to the
+right is a per-harness folder, and this package is the whole of it.
+
+Adding a harness means adding one module beside this file and one line to
+REGISTRY. Nothing else in Foundry changes, and that is the test of whether the
+seam is in the right place.
+
+What this file owns, and what no emitter may re-implement:
+
+  the registry        which module emits which harness
+  the loss policy     refuse, or record a pre-authorised drop, and nothing else
+  pruning             taking out every kind the harness cannot represent
+  the skill depth     one level under skills/, on every harness, always
+
+The loss policy has exactly two outcomes. A declared kind a harness cannot
+represent stops the build, naming the kind, the harness and the manifest line,
+and both ways forward. Or the author already wrote that loss down under
+`degrade.<target>.drop`, and it is printed and written into that harness's lock
+file. There is no third outcome and Foundry never decides by itself, which is
+the same rule as the build never picking a winner between two dependencies.
+"""
+
+from __future__ import annotations
+
+import importlib
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from resolve import CONTENT_KINDS, KINDS  # noqa: E402
+
+from .contract import (  # noqa: E402
+    COMMON_MOMENTS,
+    HOOKS_NAME,
+    MCP_NAME,
+    MOMENTS,
+    SKILL_NAME,
+    Cannot,
+    Capability,
+    EmitError,
+    check_rules,
+    frontmatter,
+    frontmatter_key,
+    hook_rules,
+    mcp_servers,
+    metadata,
+    remove,
+    rules_for,
+    skill_dirs,
+    write_json,
+)
+
+# What `build.py` calls on this package, and the whole of it. `check_rules` and
+# `hook_rules` are defined in `contract.py` and re-exported here on purpose, so
+# the build reaches every check through one name rather than reaching past this
+# package into the module behind it.
+__all__ = [
+    "EmitError",
+    "check_rules",
+    "check_skills_are_one_level_deep",
+    "declared_kinds",
+    "hook_rules",
+    "plan",
+    "run",
+]
+
+# Every harness Foundry emits, and the module that emits it. One module may
+# serve several harnesses when they share a package shape; each still declares
+# its own Capability, because sharing a shape is not sharing a capability.
+REGISTRY = {
+    "agent-plugins": "agent_plugins",
+    "claude-code": "claude_code",
+    "codex": "agent_plugins",
+    "instructions": "instructions",
+    "opencode": "skills_tree",
+    "pi": "skills_tree",
+}
+
+
+@dataclass(frozen=True)
+class Drop:
+    """One kind that will be missing from one harness's folder, on purpose."""
+
+    kind: str
+    why: str
+
+
+@dataclass(frozen=True)
+class RuleDrop:
+    """One hook rule that will not be in one harness's folder, on purpose.
+
+    A kind-level drop takes a whole surface away. This takes one rule, because
+    a moment outside the four every harness has in common is carried by some
+    and not others, and a plugin that wanted one should not have to give up
+    hooks everywhere else to get it.
+    """
+
+    at: str
+    run: str
+    why: str
+
+
+@dataclass(frozen=True)
+class Loss:
+    """What one harness will not carry. Empty is the ordinary case."""
+
+    target: str
+    dropped: tuple[Drop, ...]
+    rules: tuple[RuleDrop, ...] = ()
+
+    def kinds(self) -> tuple[str, ...]:
+        return tuple(drop.kind for drop in self.dropped)
+
+
+# ------------------------------------------------------------------- registry
+def known_targets() -> tuple[str, ...]:
+    return tuple(sorted(REGISTRY))
+
+
+def load(target: str) -> object:
+    """The module that emits this harness, checked against what it claims.
+
+    A registry line and a module's own TARGETS tuple are two statements of the
+    same fact, and two statements drift. Reading them against each other here
+    turns the drift into a build failure rather than a harness that is listed
+    and never emitted.
+    """
+    if target not in REGISTRY:
+        raise EmitError(
+            f"NO SUCH TARGET: {target}.\n\n"
+            f"  Foundry emits: {', '.join(known_targets())}.\n\n"
+            f"  Fix the name in 'targets', or drop the line. Nothing is guessed:\n"
+            f"  a misspelled harness that quietly built nothing is how a release\n"
+            f"  ships without the folder somebody was promised."
+        )
+    module = importlib.import_module(f"{__name__}.{REGISTRY[target]}")
+    if target not in getattr(module, "TARGETS", ()):
+        raise EmitError(
+            f"{module.__name__} is registered for {target} but does not claim it.\n"
+            f"  Its TARGETS are: {', '.join(getattr(module, 'TARGETS', ()))}.\n"
+            f"  This is a Foundry defect, not a problem with the plugin."
+        )
+    return module
+
+
+def capability(target: str) -> Capability:
+    """What this harness can and cannot carry, checked for completeness.
+
+    A capability that answers for only some kinds is refused here rather than
+    at the moment the unanswered kind is declared, so the gap is found on any
+    build and not only on the one plugin that happens to hold that kind.
+    """
+    module = load(target)
+    declared = getattr(module, "CAPABILITIES", {})
+    if target not in declared:
+        raise EmitError(
+            f"{module.__name__} declares no CAPABILITIES entry for {target}.\n"
+            f"  This is a Foundry defect, not a problem with the plugin."
+        )
+    answer = declared[target]
+    if answer.missing():
+        raise EmitError(
+            f"{module.__name__} does not say whether {target} carries "
+            f"{', '.join(answer.missing())}.\n"
+            f"  Every kind is answered either in 'carries' or in 'cannot'.\n"
+            f"  This is a Foundry defect, not a problem with the plugin."
+        )
+    if answer.doubled():
+        raise EmitError(
+            f"{module.__name__} says {target} both carries and cannot carry "
+            f"{', '.join(answer.doubled())}.\n"
+            f"  This is a Foundry defect, not a problem with the plugin."
+        )
+    check_moments(target, module, answer)
+    return answer
+
+
+def check_moments(target: str, module: object, answer: Capability) -> None:
+    """A harness that carries hooks names the moments it expresses, and no others.
+
+    Answered here for the same reason a capability answers for every kind: the
+    gap is found on any build rather than on the one plugin that happens to
+    name the moment nobody re-read. A harness carrying hooks and expressing
+    nothing would prune no rule and translate none either, shipping a hook file
+    with no events in it.
+    """
+    name = getattr(module, "__name__", str(module))
+    carries_hooks = "hooks" in answer.carries
+    if not carries_hooks:
+        if answer.moments:
+            raise EmitError(
+                f"{name} says {target} cannot carry hooks but names moments.\n"
+                f"  This is a Foundry defect, not a problem with the plugin."
+            )
+        return
+
+    outside = tuple(moment for moment in answer.moments if moment not in MOMENTS)
+    if outside:
+        raise EmitError(
+            f"{name} says {target} expresses {', '.join(outside)}, which is not a moment.\n"
+            f"  The moments are: {', '.join(MOMENTS)}.\n"
+            f"  This is a Foundry defect, not a problem with the plugin."
+        )
+
+    absent = tuple(moment for moment in COMMON_MOMENTS if moment not in answer.moments)
+    if absent:
+        raise EmitError(
+            f"{name} says {target} carries hooks but does not express "
+            f"{', '.join(absent)}.\n"
+            f"  Those are what every harness with a hook surface has in common.\n"
+            f"  This is a Foundry defect, not a problem with the plugin."
+        )
+
+
+# --------------------------------------------------------- what was declared
+def declared_kinds(tree: Path) -> dict[str, list[str]]:
+    """Every kind the staged tree actually holds, and what it holds of each.
+
+    Read from the tree rather than from the manifest, because the tree is what
+    ships: content taken from a dependency counts exactly as much as content
+    the plugin wrote. Names are carried along so a refusal can point at the
+    thing rather than at its category.
+
+    A dot file does not declare a kind. An empty content directory kept alive
+    by a placeholder is an empty directory, and refusing a build over one would
+    make the Foundry template unbuildable on the day it is copied.
+    """
+    found: dict[str, list[str]] = {}
+    for kind in CONTENT_KINDS:
+        directory = tree / kind
+        if not directory.is_dir():
+            continue
+        items = sorted(entry.name for entry in directory.iterdir() if not entry.name.startswith("."))
+        if items:
+            found[kind] = items
+
+    servers = mcp_servers(tree)
+    if servers:
+        found["mcp"] = sorted(servers)
+
+    restricted = [
+        skill.name for skill in skill_dirs(tree) if frontmatter(skill / SKILL_NAME).get("allowed-tools")
+    ]
+    if restricted:
+        found["allowed-tools"] = sorted(restricted)
+    return found
+
+
+def check_skills_are_one_level_deep(tree: Path, manifest_path: Path) -> None:
+    """A skill directory sits exactly one level under skills/, on every harness.
+
+    Some harnesses look exactly one level down and some recurse. A grouping
+    directory therefore ships intact on part of the list and makes every skill
+    beneath it invisible on the rest, with no error raised anywhere, so the
+    author sees a working install and the user sees nothing. Refusing is the
+    only outcome that reaches the person who can fix it.
+
+    This is checked once, on the neutral tree, and stops the whole build rather
+    than one harness: the same package must expose the same skills everywhere.
+    """
+    skills = tree / "skills"
+    if not skills.is_dir():
+        return
+    deep = sorted(
+        str(path.relative_to(tree))
+        for path in skills.rglob(SKILL_NAME)
+        if len(path.relative_to(skills).parts) != 2
+    )
+    if not deep:
+        return
+    raise EmitError(
+        "SKILL NESTED TOO DEEP.\n\n  "
+        + "\n  ".join(deep)
+        + f"\n\n  Declared by {manifest_path}. A skill directory sits exactly one level\n"
+        "  under skills/. Some harnesses look one level down and some recurse, so a\n"
+        "  nested skill installs on part of the list and is invisible on the rest\n"
+        "  with no error anywhere.\n\n"
+        "  Either move each one up to skills/<name>/, or fold the grouping into the\n"
+        "  name, as skills/<group>-<name>/."
+    )
+
+
+# ----------------------------------------------------------- the loss policy
+def assess_rules(
+    target: str, rules: list[dict], answer: Capability, manifest_path: Path
+) -> tuple[RuleDrop, ...]:
+    """The rules this harness will not carry, or a refusal naming the moment.
+
+    A rule naming a moment this harness has no event for is a hook that never
+    fires. Left alone it is the same silence as a kind a harness cannot
+    represent, so it is the same policy: refuse, naming the moment and the
+    harness and the one line that would put the loss on the record, or record
+    what the author already wrote down.
+
+    The waiver is the rule's own `only`, not a manifest block, because the loss
+    is one rule rather than a surface. A `degrade` line taking `hooks` away from
+    a harness to get one moment past it would take every other rule with it.
+    """
+    if "hooks" not in answer.carries:
+        return ()
+
+    kept, absent = rules_for(rules, target)
+    refused = [rule for rule in kept if not answer.expresses(rule["at"])]
+    if refused:
+        lines = [f"CANNOT SHIP THIS TO {target.upper()}.", ""]
+        for rule in refused:
+            lines.append(f"  A rule runs at '{rule['at']}', which {target} has no event for.")
+        lines += [
+            f"  Declared in {manifest_path}.",
+            "",
+            f"  {target} expresses: {', '.join(answer.moments)}.",
+            "",
+            "  A hook that does not fire is a guard that is not there, so this is a",
+            "  refusal rather than a rule quietly left out of one folder.",
+            "",
+            "  Either drop that harness from 'targets', or name the harnesses the rule",
+            "  is for, as 'only: [<harness>]', so the loss is on the record.",
+        ]
+        raise EmitError("\n".join(lines))
+
+    return tuple(
+        RuleDrop(at=rule["at"], run=rule["run"], why=f"the rule is only for {', '.join(rule['only'])}")
+        for rule in absent
+    )
+
+
+def assess(
+    target: str,
+    declared: dict[str, list[str]],
+    waived: list[str],
+    manifest_path: Path,
+    rules: list[dict] | None = None,
+) -> Loss:
+    """Refuse, or record what the author already agreed to lose. Nothing else.
+
+    Every kind-level loss can be waived, including the ones that gut a package:
+    the refusal itself names the waiver, so an author who reads it and decides
+    the diminished folder is still worth shipping has a way to say so. What
+    cannot be waived is a loss that changes behaviour rather than reducing it,
+    a guard that fails open or a matcher that matches everything, and those
+    depend on what is inside a file rather than on its kind. The emitter raises
+    those itself, while it is looking at the content.
+
+    A waiver is checked before any of that, against what this harness carries
+    rather than against what the plugin holds. Naming a kind the harness
+    carries is not a smaller version of the ordinary case, it is a different
+    fault: that waiver can never produce a drop no matter what the plugin later
+    holds, so it is a false statement about the build and is refused outright,
+    the same way `read_degrade` in `scripts/resolve.py` already refuses a
+    waiver naming a harness outside `targets`. Naming a kind the harness
+    genuinely cannot carry, but this plugin does not hold yet, is not a fault
+    at all: it does nothing today and becomes a real, recorded drop the day
+    content arrives, so it is printed as unused rather than refused. That
+    only says this particular waiver is not what stops the build; a
+    manifest can still hold a separate, genuine refusal elsewhere, on a
+    different target or a different kind, and this one printing as unused
+    says nothing about whether that other one does.
+    """
+    answer = capability(target)
+
+    impossible = [kind for kind in KINDS if kind in waived and kind in answer.carries]
+    if impossible:
+        raise EmitError(impossible_waiver(target, manifest_path, impossible, answer))
+
+    refused: list[tuple[str, list[str], str]] = []
+    dropped: list[Drop] = []
+    unused: list[str] = []
+
+    for kind in KINDS:
+        if kind not in answer.cannot:
+            continue
+        why = answer.cannot[kind].why
+        if kind not in declared:
+            if kind in waived:
+                unused.append(kind)
+            continue
+        if kind in waived:
+            dropped.append(Drop(kind=kind, why=why))
+        else:
+            refused.append((kind, declared[kind], why))
+
+    if refused:
+        raise EmitError(refusal(target, manifest_path, refused))
+
+    if unused:
+        print(unused_waiver(target, manifest_path, unused))
+
+    # A waived `hooks` takes every rule with it, and that loss is already on the
+    # record as the kind. Assessing rules under it would print the same loss a
+    # second time, once per rule, in the name of a folder that has no hooks.
+    waived_away = any(drop.kind == "hooks" for drop in dropped)
+    assessed = () if waived_away else assess_rules(target, rules or [], answer, manifest_path)
+
+    return Loss(target=target, dropped=tuple(dropped), rules=assessed)
+
+
+def name_item(kind: str, item: str) -> str:
+    """Point at the thing, not at its category, in whatever shape it has.
+
+    Three of the six kinds are directories and read as a path. `mcp` names a
+    server inside one file. `allowed-tools` is not a thing at all, it is a
+    field inside a skill, and calling it `allowed-tools/<skill>` would send the
+    author looking for a directory that does not exist.
+    """
+    if kind == "allowed-tools":
+        return f"allowed-tools on skills/{item}"
+    return f"{kind}/{item}"
+
+
+def refusal(target: str, manifest_path: Path, refused: list[tuple[str, list[str], str]]) -> str:
+    """Name the kind, the harness, the manifest line, and both ways forward.
+
+    The second way forward is deliberately more work than the first. Deleting a
+    harness from 'targets' is one line; writing the loss down is a block. A
+    diminished package should feel like a decision, because it is one.
+    """
+    lines = [f"CANNOT SHIP THIS TO {target.upper()}.", ""]
+    for kind, items, why in refused:
+        named = ", ".join(name_item(kind, item) for item in items)
+        verb = "is" if len(items) == 1 else "are"
+        lines.append(f"  {named} {verb} declared in {manifest_path}, and {why}.")
+    kinds = ", ".join(kind for kind, _, _ in refused)
+    lines += [
+        "",
+        f"  Either drop {target} from 'targets', or write it down under",
+        f"  'degrade.{target}.drop: [{kinds}]' so the loss is on the record.",
+    ]
+    return "\n".join(lines)
+
+
+def impossible_waiver(target: str, manifest_path: Path, kinds: list[str], answer: Capability) -> str:
+    """A waiver naming a kind this harness carries can never be true.
+
+    Matches the shape of `read_degrade`'s refusal in `scripts/resolve.py`,
+    which already refuses the sibling case one step earlier: a waiver naming a
+    harness that is not even in `targets`. That one names the block and the
+    fact, says why a waiver nobody reads does nothing, and names the fix. This
+    one does the same for a waiver that is read, on a harness that is built,
+    naming a kind that harness ships regardless of what the waiver claims.
+    """
+    named = ", ".join(kinds)
+    verb = "carries" if len(kinds) == 1 else "carry"
+    lines = [
+        f"{manifest_path}: 'degrade.{target}.drop' names {named}, and {target} {verb} "
+        f"{'it' if len(kinds) == 1 else 'them'}.",
+        "",
+        f"  {target} carries: {', '.join(answer.carries)}.",
+        "",
+        "  A waiver only records a loss that is really going to happen. Naming a kind",
+        f"  {target} carries can never produce a drop, however this plugin's content",
+        "  changes, so the waiver is a false statement about the build rather than an",
+        "  early one.",
+        "",
+        f"  Remove {named} from 'degrade.{target}.drop'.",
+    ]
+    return "\n".join(lines)
+
+
+def unused_waiver(target: str, manifest_path: Path, kinds: list[str]) -> str:
+    """A waiver for a kind this harness cannot carry, but does not hold yet.
+
+    Not a fault: `target` really cannot carry these kinds, and the day this
+    plugin gains one of them the waiver stops being unused and becomes a
+    recorded drop, the ordinary case `refusal` and `Drop` already cover.
+    Refusing it today would refuse Foundry's own template, whose `degrade`
+    blocks are written before the plugin has anything to drop. Printed rather
+    than silent for the same reason a drop already agreed to is still printed
+    on every build: a line an author cannot see is a line they cannot check.
+
+    The line says only that this one waiver is not what stops the build. A
+    manifest can carry a genuine refusal somewhere else entirely, on another
+    target or another kind, and this one printing as unused says nothing
+    about whether the build as a whole went through.
+    """
+    named = ", ".join(kinds)
+    return (
+        f"{manifest_path}: 'degrade.{target}.drop' names {named}, which {target} cannot carry "
+        f"and this plugin does not hold yet.\n"
+        f"  This declaration is not what stops the build. It takes effect the day\n"
+        f"  this plugin holds {named}."
+    )
+
+
+def check_rules_reach_a_harness(
+    targets: list[str], losses: dict[str, Loss], rules: list[dict], manifest_path: Path
+) -> None:
+    """A rule kept by no harness in this build is refused.
+
+    `only` narrows a rule to the harnesses named, and `check_rule` already
+    refuses a name outside 'targets'. That is not enough on its own. A name can
+    be in 'targets' and still carry no hooks, either because that harness has no
+    hook surface at all or because 'degrade' took hooks away from it, and either
+    way the rule is absent from every folder the build writes.
+
+    Both halves of that are recorded, one as a rule drop and one as a kind drop,
+    so nothing is silent. But they are recorded against two different harnesses
+    and read separately as ordinary losses, and what they add up to is a guard
+    the author wrote that runs nowhere. That is the outcome this build system
+    exists to refuse, so it is refused here, where every harness's loss is known
+    and no folder has been written yet.
+    """
+    if not rules:
+        return
+
+    alive = [
+        target
+        for target in targets
+        if "hooks" in capability(target).carries
+        and not any(drop.kind == "hooks" for drop in losses[target].dropped)
+    ]
+
+    nowhere = [rule for rule in rules if not any(rules_for([rule], target)[0] for target in alive)]
+    if not nowhere:
+        return
+
+    lines = ["NO HARNESS WOULD RUN THIS HOOK.", ""]
+    for rule in nowhere:
+        only = rule.get("only")
+        reserved = f"is only for {', '.join(only)}" if only else "is for every harness"
+        lines.append(f"  The rule at '{rule['at']}' {reserved}, and none of those carries hooks here.")
+    lines += [
+        f"  Declared in {manifest_path}.",
+        "",
+        f"  Carrying hooks in this build: {', '.join(alive) if alive else 'no harness in targets'}.",
+        "",
+        "  A rule absent from every folder the build writes is a guard that runs",
+        "  nowhere, and the build reporting success is what makes it dangerous.",
+        "",
+        "  Either name a harness that carries hooks in 'only', or take the rule out.",
+    ]
+    raise EmitError("\n".join(lines))
+
+
+def plan(
+    targets: list[str],
+    declared: dict[str, list[str]],
+    degrade: dict[str, list[str]],
+    manifest_path: Path,
+    rules: list[dict] | None = None,
+) -> dict[str, Loss]:
+    """One Loss per harness, or the first refusal, decided before anything is written.
+
+    Every harness is assessed before any folder is emitted, so a build that
+    cannot ship one of them stops without having written the others. Half a
+    release is worse than none: the assets that did appear look complete.
+    """
+    losses = {
+        target: assess(target, declared, degrade.get(target, []), manifest_path, rules) for target in targets
+    }
+    if declared and all(set(loss.kinds()) == set(declared) for loss in losses.values()):
+        rows = "\n".join(f"    {target:<16}drops {', '.join(losses[target].kinds())}" for target in targets)
+        raise EmitError(
+            "NOTHING WOULD SHIP.\n\n"
+            f"  Every harness in 'targets' drops everything {manifest_path} declares.\n\n"
+            f"{rows}\n\n"
+            f"  This plugin holds {', '.join(sorted(declared))} and no named harness carries\n"
+            "  any of it, so every folder in the release would be an empty wrapper.\n\n"
+            "  Either name a harness that carries what this plugin holds, or stop\n"
+            "  declaring the kinds nothing carries."
+        )
+
+    # After the refusal above, never before it. A plugin holding hooks and
+    # nothing else, with every harness dropping them, is both faults at once,
+    # and the one that says the whole release would be empty is the one worth
+    # reading first.
+    check_rules_reach_a_harness(targets, losses, rules or [], manifest_path)
+    return losses
+
+
+# ------------------------------------------------------------------- emitting
+def prune(target: str, tree: Path, answer: Capability) -> None:
+    """Take out every kind this harness cannot represent, whether declared or not.
+
+    A kind the harness cannot represent is a different thing from a file it
+    simply never opens, and only the first is pruned here. A whole kind sitting
+    in a folder that cannot represent it is inside the folder's `contents`
+    fingerprint with nothing to explain why, the same failure as the author's
+    local settings reaching people who installed a plugin.
+
+    Loose files stay. The unread-file rule is narrower than it once read: no
+    folder may hold a neutral file whose translated twin it also holds, and
+    everything else the repository ships, ships. Every packaged folder already
+    carries `README.md`, which its own harness never opens.
+
+    Pruning is here rather than in each emitter because it is identical for
+    every harness: what differs is the list of kinds, which the emitter already
+    declared.
+
+    A kind this chain has no branch for is refused rather than passed over. The
+    capability check makes declaring a seventh kind loud; without the refusal
+    below, carrying it would be silent, which is the half that ships. The chain
+    is exhaustive over KINDS today, so nothing reaches it until somebody grows
+    KINDS or misspells a key in `cannot`.
+    """
+    for kind in answer.cannot:
+        if kind in CONTENT_KINDS:
+            remove(tree / kind)
+        elif kind == "mcp":
+            remove(tree / MCP_NAME)
+        elif kind == "allowed-tools":
+            strip_allowed_tools(tree)
+        else:
+            raise EmitError(
+                f"FOUNDRY CANNOT PRUNE {kind!r}.\n\n"
+                f"  {target} says it cannot carry {kind!r}, and pruning has no branch\n"
+                f"  for that kind, so nothing would be taken out of the folder. It\n"
+                f"  would ship inside a fingerprint with nothing able to explain it.\n\n"
+                f"  Foundry prunes: {', '.join(KINDS)}.\n"
+                f"  Declared in scripts/emitters/{REGISTRY.get(target, '<harness>')}.py,\n"
+                f"  in CAPABILITIES for {target}, under 'cannot'.\n\n"
+                f"  This is a Foundry defect, not a problem with the plugin. Either the\n"
+                f"  key is misspelled there, or a kind was added to KINDS in resolve.py\n"
+                f"  without telling 'prune' where that kind lives in the tree. Add the\n"
+                f"  branch, then this refusal goes back to being unreachable."
+            )
+
+
+def strip_allowed_tools(tree: Path) -> None:
+    """Take `allowed-tools` out of every skill file, leaving the rest untouched.
+
+    The field is rewritten line by line rather than by reloading and re-dumping
+    the frontmatter, because a re-dump reformats a file the author wrote and
+    every reformatted byte lands in a `contents` fingerprint looking like a
+    content change.
+
+    The line edit and `frontmatter` decide the same fact two different ways,
+    and disagreeing about it used to be possible: `frontmatter_key` closes the
+    known gap, a quoted key, but there will always be a YAML form the matcher
+    does not know. So every skill is checked with the real parser after the
+    edit runs, whether or not the edit changed anything, and a key the parser
+    still sees stops the build rather than shipping a lock file that records
+    the drop while the file still carries it, which is worse than a silent
+    drop because the record would be actively lying.
+    """
+    for skill in skill_dirs(tree):
+        path = skill / SKILL_NAME
+        lines = path.read_text().splitlines(keepends=True)
+        if not lines or lines[0].strip() != "---":
+            continue
+        closing = next((i for i in range(1, len(lines)) if lines[i].strip() == "---"), None)
+        if closing is None:
+            continue
+        kept, index = [], 0
+        while index < len(lines):
+            line = lines[index]
+            if (
+                0 < index < closing
+                and frontmatter_key(line) == "allowed-tools"
+                and not line.startswith((" ", "\t"))
+            ):
+                index += 1
+                # A block value continues on the following, more indented lines.
+                while index < closing and lines[index].startswith((" ", "\t", "-")):
+                    index += 1
+                continue
+            kept.append(line)
+            index += 1
+        if len(kept) != len(lines):
+            path.write_text("".join(kept))
+        if "allowed-tools" in frontmatter(path):
+            raise EmitError(
+                f"DROPPED allowed-tools, AND {path} STILL HAS IT.\n\n"
+                f"  The lock file is about to record allowed-tools as dropped from this\n"
+                f"  folder, and the line edit meant to remove it left a form the parser\n"
+                f"  still reads as carrying the key. Shipping this would be worse than a\n"
+                f"  silent drop: the record would say the field is gone while the file\n"
+                f"  still has it.\n\n"
+                f"  This is a Foundry defect. Read the frontmatter block in {path} and\n"
+                f"  extend the matcher in strip_allowed_tools to cover its form."
+            )
+
+
+def run(target: str, manifest: dict, tree: Path) -> None:
+    """Turn one copy of the staged tree into one harness's folder, in place.
+
+    Pruning happens first so that an emitter is never handed content its own
+    harness cannot carry, which is what keeps every emitter free of loss logic.
+    """
+    module = load(target)
+    prune(target, tree, capability(target))
+    try:
+        module.emit(target, manifest, tree)
+    except NotImplementedError as gap:
+        # A registered harness whose emitter is not written yet. A traceback
+        # here would read as a crash in the plugin's own build and name no next
+        # step, when the truth is that Foundry cannot do this and the plugin is
+        # fine. This disappears the moment every registered emitter is written.
+        raise EmitError(
+            f"FOUNDRY CANNOT BUILD {target.upper()} YET.\n\n"
+            f"  {gap}\n\n"
+            f"  This is a Foundry defect, not a problem with the plugin. Either take\n"
+            f"  {target} out of 'targets' for now, or build with a Foundry that has it."
+        ) from gap
+
+
+__all__ = [
+    "Cannot",
+    "Capability",
+    "Drop",
+    "EmitError",
+    "HOOKS_NAME",
+    "Loss",
+    "MCP_NAME",
+    "REGISTRY",
+    "SKILL_NAME",
+    "assess",
+    "capability",
+    "check_skills_are_one_level_deep",
+    "declared_kinds",
+    "frontmatter",
+    "hook_rules",
+    "known_targets",
+    "load",
+    "mcp_servers",
+    "metadata",
+    "plan",
+    "prune",
+    "run",
+    "skill_dirs",
+    "write_json",
+]
